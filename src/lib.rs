@@ -2,3 +2,4 @@
 
 pub mod board;
 pub mod quadrature;
+pub mod stepper;

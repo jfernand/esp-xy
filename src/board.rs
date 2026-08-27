@@ -241,6 +241,7 @@ pub struct RemainingPeripherals<'d> {
     pub wifi: peripherals::WIFI<'d>,
     pub bt: peripherals::BT<'d>,
     pub pcnt: peripherals::PCNT<'d>,
+    pub mcpwm0: peripherals::MCPWM0<'d>,
 }
 
 impl Default for BoardPeripherals<'static> {
@@ -274,6 +275,7 @@ impl Default for BoardPeripherals<'static> {
                 wifi: peripherals.WIFI,
                 bt: peripherals.BT,
                 pcnt: peripherals.PCNT,
+                mcpwm0: peripherals.MCPWM0,
             },
         }
     }
