@@ -8,12 +8,15 @@
 #![deny(clippy::large_stack_frames)]
 
 use defmt::{error, info};
+use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::main;
+use esp_hal::pcnt::Pcnt;
 use esp_hal::time::{Duration, Instant};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::ble::controller::BleConnector;
 use esp_xy::board::Board;
+use esp_xy::quadrature::QuadratureDecoder;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -42,6 +45,13 @@ fn main() -> ! {
 
     let mut board = Board::new();
 
+    let quad_pull = InputConfig::default().with_pull(Pull::Up);
+    let encoder = QuadratureDecoder::new(
+        Pcnt::new(board.remaining.pcnt).unit0,
+        Input::new(board.d0, quad_pull),
+        Input::new(board.d1, quad_pull),
+    );
+
     let timg0 = TimerGroup::new(board.remaining.timg0);
     let sw_interrupt =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(board.remaining.sw_interrupt);
@@ -53,7 +63,7 @@ fn main() -> ! {
 
     loop {
         board.user_led.toggle();
-        info!("Hello world!");
+        info!("encoder count: {}", encoder.count());
         let delay_start = Instant::now();
         while delay_start.elapsed() < Duration::from_millis(500) {}
     }

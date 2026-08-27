@@ -240,6 +240,7 @@ pub struct RemainingPeripherals<'d> {
     pub sw_interrupt: peripherals::SW_INTERRUPT<'d>,
     pub wifi: peripherals::WIFI<'d>,
     pub bt: peripherals::BT<'d>,
+    pub pcnt: peripherals::PCNT<'d>,
 }
 
 impl Default for BoardPeripherals<'static> {
@@ -272,6 +273,7 @@ impl Default for BoardPeripherals<'static> {
                 sw_interrupt: peripherals.SW_INTERRUPT,
                 wifi: peripherals.WIFI,
                 bt: peripherals.BT,
+                pcnt: peripherals.PCNT,
             },
         }
     }
