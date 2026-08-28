@@ -1,5 +1,9 @@
 //! Electronic leadscrew: drives a closed-loop stepper on the lathe carriage at a fixed ratio
-//! of spindle rotation, read from a quadrature encoder via PCNT.
+//! of spindle rotation, read from a quadrature encoder via PCNT. Commandable at runtime over
+//! BLE using a RESP-style protocol (see `esp_xy::resp`) carried over a Nordic UART Service
+//! (NUS) GATT service -- any generic BLE terminal app (nRF Connect, "Serial Bluetooth
+//! Terminal", ...) can drive it today; a proper app can be layered on later without changing
+//! anything on this side, since it would speak the exact same protocol.
 //!
 //! Architecture (see project conversation for the full derivation):
 //! - The spindle encoder's extended position (`QuadratureDecoder::update`) is the single
@@ -13,6 +17,18 @@
 //!   precise regardless of this loop's own jitter.
 //! - An RPM x pitch interlock stops stepping if the selected ratio would demand a step rate
 //!   beyond what's sane for the driver/motor -- see `MAX_RPM_PITCH_UM`.
+//!
+//! BLE integration note: `bleps`'s *sync* `AttributeServer` (`bleps::attribute_server`, not
+//! `bleps::async_attribute_server`) is used deliberately -- it's driven by one
+//! `do_work_with_notification()` call per control tick, which is non-blocking under the hood
+//! (`esp_radio`'s `BleConnector::read()` drains whatever's immediately available and returns
+//! rather than waiting), so BLE traffic can never stall the 1ms tick. No async executor is
+//! needed or used here.
+//!
+//! On disconnect (`WorkResult::GotDisconnected`), advertising is restarted and the attribute
+//! server is rebuilt so a new client can reconnect without a board reset. The control loop
+//! itself does not depend on BLE at all -- if the link drops, the leadscrew simply keeps
+//! executing its last commanded state until a client reconnects, which is the safe behavior.
 
 #![no_std]
 #![no_main]
@@ -22,16 +38,29 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use core::cell::RefCell;
+use core::fmt::Write as _;
+
+use bleps::ad_structure::{
+    AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE, create_advertising_data,
+};
+use bleps::attribute_server::{AttributeServer, NotificationData, WorkResult};
+use bleps::no_rng::NoRng;
+use bleps::{Ble, HciConnector, gatt};
 use defmt::{error, info};
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::main;
 use esp_hal::mcpwm::operator::PwmPinConfig;
 use esp_hal::mcpwm::{McPwm, PeripheralClockConfig};
 use esp_hal::pcnt::Pcnt;
 use esp_hal::time::{Duration, Instant, Rate};
+use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
+use esp_radio::ble::controller::BleConnector;
 use esp_xy::board::Board;
 use esp_xy::quadrature::QuadratureDecoder;
+use esp_xy::resp::{self, Command};
 use esp_xy::stepper::{Direction, StepGenerator};
 
 #[panic_handler]
@@ -59,15 +88,10 @@ const MOTOR_FULL_STEPS_PER_REV: i64 = 200;
 const MICROSTEPS: i64 = 16;
 const MICROSTEPS_PER_REV: i64 = MOTOR_FULL_STEPS_PER_REV * MICROSTEPS;
 
-/// Carriage travel per spindle revolution, in micrometers. Demo value: a 3mm/rev thread
-/// pitch, the coarse-threading case sized in the conversation. Positive moves the carriage in
-/// the direction that `Direction::Forward` drives it.
-const PITCH_UM: i64 = 3_000;
-
-/// Interlock ceiling on |RPM| x |pitch|, in RPM x micrometers. Above this, the requested ratio
+/// Interlock ceiling on |RPM| x |ratio|, in RPM x micrometers. Above this, the requested ratio
 /// would need a step rate that pushes the closed-loop stepper's shaft speed past a sane
-/// torque-margin limit. 5000 RPM x mm keeps the motor shaft under ~1000 RPM at this pitch/
-/// microstepping combination -- tune to your actual motor's torque-speed curve.
+/// torque-margin limit. 5000 RPM x mm keeps the motor shaft under ~1000 RPM at a 3mm/rev
+/// pitch/this microstepping combination -- tune to your actual motor's torque-speed curve.
 const MAX_RPM_PITCH_UM: i64 = 5_000_000;
 
 /// MCPWM timer period: with a 40MHz peripheral clock this gives a 200kHz ceiling and a
@@ -75,6 +99,249 @@ const MAX_RPM_PITCH_UM: i64 = 5_000_000;
 /// worst case with headroom to spare.
 const MCPWM_PERIOD: u16 = 199;
 
+/// Fixed jog rate (steps/sec) used by `MODE JOG` while `ENABLE`d -- ignores the spindle
+/// entirely and just runs the stepper at a constant rate in the configured direction.
+const JOG_STEPS_PER_SEC: u32 = 1600;
+
+// Nordic UART Service (NUS) UUIDs -- a de facto standard, recognized by many generic BLE
+// terminal apps, which is the whole point: it lets a generic app be today's test client.
+// Service: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+// RX (write, client -> device): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+// TX (notify, device -> client): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+// (Used as string literals directly in the `gatt!` invocation below -- it needs literal
+// tokens, not `const` references, since it expands at macro time.)
+
+/// Command/status mode. `Feed` and `Thread` are mathematically identical (both track the
+/// spindle at `ratio_um`) -- the distinction is purely what the operator is doing with it.
+/// `Jog` ignores the spindle and runs at a fixed rate while enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Feed,
+    Thread,
+    Jog,
+}
+
+/// Everything the BLE link needs to read or write, behind one `RefCell` so the GATT read/
+/// write closures (which only get `&self`/shared captures) and the control loop (plain code)
+/// can share it without unsafe.
+struct Link {
+    // Inbound line buffer.
+    rx_line: [u8; 96],
+    rx_len: usize,
+
+    // Outbound: at most one frame in flight, drained into a BLE notification once per tick.
+    // Replies (from a completed command) and pushes (periodic/edge-triggered status) share
+    // this slot; a reply is written here synchronously inside the write callback, so it goes
+    // out on the *next* tick rather than the one that produced it -- fine, one tick is
+    // imperceptible for a human typing commands.
+    pending: Option<([u8; 128], usize)>,
+    // Last frame actually sent, served back to a manual GATT read instead of relying only on
+    // notify (not every client bothers to subscribe before poking a characteristic).
+    last_tx: ([u8; 128], usize),
+
+    // Commanded state, mutated only by parsed RESP commands.
+    mode: Mode,
+    ratio_um: i64,
+    direction: Direction,
+    enabled: bool,
+
+    // Latest status snapshot, refreshed once per tick by the control loop, read by both the
+    // periodic push and an on-demand `STATUS` command reply.
+    rpm: i64,
+    position: i64,
+    target_steps: i64,
+    fault: bool,
+}
+
+impl Link {
+    fn new() -> Self {
+        Self {
+            rx_line: [0; 96],
+            rx_len: 0,
+            pending: None,
+            last_tx: ([0; 128], 0),
+            mode: Mode::Feed,
+            ratio_um: 0,
+            direction: Direction::Forward,
+            enabled: false,
+            rpm: 0,
+            position: 0,
+            target_steps: 0,
+            fault: false,
+        }
+    }
+
+    /// Formats the shared status payload: `RPM=<n> POS=<n> TARGET=<n> STATE=<RUN|OFF|FAULT>`.
+    fn format_status<'a>(&self, buf: &'a mut [u8]) -> &'a str {
+        let mut w = FixedWriter::new(buf);
+        let state = if self.fault {
+            "FAULT"
+        } else if self.enabled {
+            "RUN"
+        } else {
+            "OFF"
+        };
+        let _ = write!(
+            w,
+            "RPM={} POS={} TARGET={} STATE={}",
+            self.rpm, self.position, self.target_steps, state
+        );
+        w.finish()
+    }
+
+    /// Queues a reply/push frame built from `payload` via `encode` (one of
+    /// `resp::write_ok`/`write_err`/`write_bulk`/`write_push`, partially applied).
+    fn queue(&mut self, encode: impl FnOnce(&mut [u8]) -> Option<usize>) {
+        let mut buf = [0u8; 128];
+        if let Some(len) = encode(&mut buf) {
+            self.pending = Some((buf, len));
+        }
+    }
+
+    /// Handles one complete command line, mutating state and queuing a reply.
+    fn handle_line(&mut self, line: &str) {
+        let cmd = Command::parse(line);
+        match cmd.name() {
+            "MODE" => {
+                if self.enabled {
+                    self.queue(|b| resp::write_err(b, "busy, DISABLE first"));
+                    return;
+                }
+                match cmd.arg(0) {
+                    Some("FEED") => {
+                        self.mode = Mode::Feed;
+                        self.queue(resp::write_ok);
+                    }
+                    Some("THREAD") => {
+                        self.mode = Mode::Thread;
+                        self.queue(resp::write_ok);
+                    }
+                    Some("JOG") => {
+                        self.mode = Mode::Jog;
+                        self.queue(resp::write_ok);
+                    }
+                    _ => self.queue(|b| resp::write_err(b, "bad mode")),
+                }
+            }
+            "RATIO" => {
+                if self.enabled {
+                    self.queue(|b| resp::write_err(b, "busy, DISABLE first"));
+                    return;
+                }
+                match cmd
+                    .arg(0)
+                    .and_then(|a| {
+                        a.parse::<i64>()
+                            .ok()
+                    }) {
+                    Some(um) if um >= 0 => {
+                        self.ratio_um = um;
+                        self.queue(resp::write_ok);
+                    }
+                    _ => self.queue(|b| resp::write_err(b, "bad ratio")),
+                }
+            }
+            "DIR" => match cmd.arg(0) {
+                Some("FWD") => {
+                    self.direction = Direction::Forward;
+                    self.queue(resp::write_ok);
+                }
+                Some("REV") => {
+                    self.direction = Direction::Reverse;
+                    self.queue(resp::write_ok);
+                }
+                _ => self.queue(|b| resp::write_err(b, "bad dir")),
+            },
+            "ENABLE" => {
+                self.enabled = true;
+                self.queue(resp::write_ok);
+            }
+            "DISABLE" => {
+                self.enabled = false;
+                self.queue(resp::write_ok);
+            }
+            "STATUS" => {
+                let mut status_buf = [0u8; 96];
+                let status = self.format_status(&mut status_buf);
+                self.queue(|b| resp::write_bulk(b, status));
+            }
+            _ => self.queue(|b| resp::write_err(b, "unknown command")),
+        }
+    }
+
+    /// Feeds newly-received bytes in, splitting on `\n` and handling each complete line.
+    fn on_rx(&mut self, data: &[u8]) {
+        for &byte in data {
+            if byte == b'\n' {
+                let mut end = self.rx_len;
+                if end > 0 && self.rx_line[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                // Copy out before resetting rx_len/calling handle_line, so the borrow of the
+                // line doesn't overlap with the &mut self that handle_line needs.
+                let mut line_buf = [0u8; 96];
+                line_buf[..end].copy_from_slice(&self.rx_line[..end]);
+                self.rx_len = 0;
+                if let Ok(line) = core::str::from_utf8(&line_buf[..end])
+                    && !line.is_empty()
+                {
+                    self.handle_line(line);
+                }
+            } else if self.rx_len
+                < self
+                    .rx_line
+                    .len()
+            {
+                self.rx_line[self.rx_len] = byte;
+                self.rx_len += 1;
+            } else {
+                // Line too long for the buffer -- drop it rather than silently truncating.
+                self.rx_len = 0;
+            }
+        }
+    }
+}
+
+/// A tiny `core::fmt::Write` sink over a fixed byte buffer, for building short status strings
+/// with no heap allocation.
+struct FixedWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> FixedWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    /// Consumes the writer to hand back a `&'a str` tied to the original buffer's lifetime
+    /// rather than to this (local) writer struct's.
+    fn finish(self) -> &'a str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for FixedWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        if self.len + bytes.len()
+            > self
+                .buf
+                .len()
+        {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "BLE GATT setup allocates a handful of fixed buffers/closures inline; still well \
+    within budget"
+)]
 #[main]
 fn main() -> ! {
     let board = Board::new();
@@ -115,73 +382,275 @@ fn main() -> ! {
     let mut carriage =
         StepGenerator::new(mcpwm_clock, mcpwm.timer0, step_pin, dir_pin, MCPWM_PERIOD);
 
+    // BLE needs the scheduler running, same as the radio/Wi-Fi init pattern in main.rs.
+    let timg0 = TimerGroup::new(
+        board
+            .remaining
+            .timg0,
+    );
+    let sw_interrupt = SoftwareInterruptControl::new(
+        board
+            .remaining
+            .sw_interrupt,
+    );
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+
+    let connector = BleConnector::new(
+        board
+            .remaining
+            .bt,
+        Default::default(),
+    )
+    .expect("BLE radio init failed");
+    let hci = HciConnector::new(connector, now_millis);
+    let mut ble = Ble::new(&hci);
+    ble.init()
+        .expect("BLE HCI init failed");
+    ble.cmd_set_le_advertising_parameters()
+        .expect("failed to set advertising parameters");
+    ble.cmd_set_le_advertising_data(
+        create_advertising_data(&[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName("leadscrew"),
+        ])
+        .expect("advertising data too long"),
+    )
+    .expect("failed to set advertising data");
+    ble.cmd_set_le_advertise_enable(true)
+        .expect("failed to enable advertising");
+
+    let link = RefCell::new(Link::new());
+
+    let mut rx_write = |_offset: usize, data: &[u8]| {
+        link.borrow_mut()
+            .on_rx(data);
+    };
+    let mut tx_read = |offset: usize, data: &mut [u8]| {
+        let link = link.borrow();
+        let (buf, len) = &link.last_tx;
+        let off = offset.min(*len);
+        let n = data
+            .len()
+            .min(len - off);
+        data[..n].copy_from_slice(&buf[off..off + n]);
+        n
+    };
+
+    gatt!([service {
+        uuid: "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+        characteristics: [
+            characteristic {
+                name: "rx",
+                uuid: "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+                write: rx_write,
+            },
+            characteristic {
+                name: "tx",
+                uuid: "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+                notify: true,
+                read: tx_read,
+            },
+        ],
+    },]);
+
+    let mut rng = NoRng;
+
     info!(
-        "leadscrew: {} counts/rev spindle, {} pitch um, {} microsteps/rev, interlock {} RPM*um",
-        SPINDLE_COUNTS_PER_REV, PITCH_UM, MICROSTEPS_PER_REV, MAX_RPM_PITCH_UM
+        "leadscrew: {} counts/rev spindle, {} microsteps/rev, interlock {} RPM*um, advertising \
+        as \"leadscrew\"",
+        SPINDLE_COUNTS_PER_REV, MICROSTEPS_PER_REV, MAX_RPM_PITCH_UM
     );
 
     let mut last_position: i64 = 0;
     let mut steps_emitted: i64 = 0;
-    let mut interlocked = false;
-    let mut status_countdown: u32 = 0;
+    let mut fault = false;
+    let mut push_countdown: u32 = 0;
 
+    // Raw pointers so `AttributeServer` can be rebuilt from scratch each BLE session (see
+    // below) without the borrow checker treating `ble`/`gatt_attributes`/`rng` as borrowed for
+    // the rest of the function -- it can't reason about a loop-local borrow that's supposed to
+    // end and restart every iteration, since `AttributeServer<'a, R>` ties all three inputs to
+    // one invariant lifetime. Soundness is on us here: exactly one `AttributeServer` (and thus
+    // at most one live `&mut` reborrow of each pointee) exists at a time, ended by an explicit
+    // `drop(srv)` below before the pointers are ever dereferenced again.
+    let ble_ptr: *mut Ble = &mut ble;
+    let gatt_ptr: *mut _ = &mut gatt_attributes;
+    let rng_ptr: *mut NoRng = &mut rng;
+
+    // Outer loop: one iteration per BLE connection "session". `srv` is rebuilt fresh each time
+    // around -- that's what lets `ble.cmd_set_le_advertise_enable` be called again once the
+    // inner loop exits on disconnect, to make the device connectable again without a board
+    // reset. All control-loop state above lives outside this loop, so a disconnect never
+    // interrupts the leadscrew itself, only the BLE link.
     loop {
-        let tick_start = Instant::now();
+        let mut srv = AttributeServer::new(
+            unsafe { &mut *ble_ptr },
+            unsafe { &mut *gatt_ptr },
+            unsafe { &mut *rng_ptr },
+        );
 
-        let position = spindle.update();
-        let delta = position - last_position;
-        last_position = position;
-        let rpm = delta * 60 * TICK_HZ / SPINDLE_COUNTS_PER_REV;
+        loop {
+            let tick_start = Instant::now();
 
-        let now_interlocked =
-            rpm.unsigned_abs() * PITCH_UM.unsigned_abs() > MAX_RPM_PITCH_UM as u64;
-        if now_interlocked && !interlocked {
-            error!(
-                "interlock tripped: {} RPM x {} um pitch exceeds {} RPM*um limit",
-                rpm, PITCH_UM, MAX_RPM_PITCH_UM
-            );
-        } else if !now_interlocked && interlocked {
-            info!("interlock cleared");
-        }
-        interlocked = now_interlocked;
-
-        let target_steps = (position * PITCH_UM * MICROSTEPS_PER_REV)
-            / (BALLSCREW_PITCH_UM * SPINDLE_COUNTS_PER_REV);
-        let step_delta = target_steps - steps_emitted;
-
-        let (steps_per_sec, direction) = if interlocked || step_delta == 0 {
-            (0u32, Direction::Forward)
-        } else {
-            let direction = if step_delta > 0 {
-                Direction::Forward
-            } else {
-                Direction::Reverse
+            // Drain one pending outbound frame (a command reply from last tick, or a push we
+            // queued last tick) as this tick's notification, but only if the client has
+            // actually subscribed -- and service any inbound command synchronously (may queue
+            // a reply for *next* tick's send).
+            let mut notification = None;
+            let subscribed = {
+                let mut cccd = [0u8; 1];
+                matches!(
+                    srv.get_characteristic_value(tx_notify_enable_handle, 0, &mut cccd),
+                    Some(1)
+                ) && cccd[0] == 1
             };
-            let rate = (step_delta.unsigned_abs() as u32).saturating_mul(TICK_HZ as u32);
-            (rate, direction)
-        };
-
-        match carriage.set_rate(steps_per_sec, direction) {
-            Ok(()) => {
-                if steps_per_sec != 0 {
-                    steps_emitted = target_steps;
+            if subscribed {
+                let mut link_mut = link.borrow_mut();
+                if let Some((buf, len)) = link_mut
+                    .pending
+                    .take()
+                {
+                    link_mut.last_tx = (buf, len);
+                    notification = Some(NotificationData::new(
+                        tx_handle,
+                        &link_mut
+                            .last_tx
+                            .0[..len],
+                    ));
                 }
             }
-            Err(_) => {
-                error!("step rate {} Hz out of range, stopping", steps_per_sec);
-                carriage.stop();
+            match srv.do_work_with_notification(notification) {
+                Ok(WorkResult::GotDisconnected) => break,
+                Ok(WorkResult::DidWork) => {}
+                Err(_) => error!("BLE attribute server error"),
             }
+
+            // Read the commanded state for this tick.
+            let (mode, ratio_um, direction, enabled) = {
+                let link = link.borrow();
+                (link.mode, link.ratio_um, link.direction, link.enabled)
+            };
+
+            let position = spindle.update();
+            let delta = position - last_position;
+            last_position = position;
+            let rpm = delta * 60 * TICK_HZ / SPINDLE_COUNTS_PER_REV;
+
+            let signed_ratio_um = match direction {
+                Direction::Forward => ratio_um,
+                Direction::Reverse => -ratio_um,
+            };
+            let now_fault =
+                rpm.unsigned_abs() * signed_ratio_um.unsigned_abs() > MAX_RPM_PITCH_UM as u64;
+            if now_fault && !fault {
+                error!(
+                    "interlock tripped: {} RPM x {} um ratio exceeds {} RPM*um limit",
+                    rpm, signed_ratio_um, MAX_RPM_PITCH_UM
+                );
+            } else if !now_fault && fault {
+                info!("interlock cleared");
+            }
+            fault = now_fault;
+
+            let target_steps = if mode == Mode::Jog {
+                // Jog ignores the spindle; steps_emitted just chases a fixed rate below.
+                steps_emitted
+            } else {
+                (position * signed_ratio_um * MICROSTEPS_PER_REV)
+                    / (BALLSCREW_PITCH_UM * SPINDLE_COUNTS_PER_REV)
+            };
+
+            // While disabled (or faulted), keep steps_emitted pinned to the current target so
+            // re-enabling never tries to "catch up" on motion that happened while declutched --
+            // that would be a sudden, unsafe burst. This is exactly a mechanical clutch's
+            // behavior.
+            if !enabled || fault {
+                steps_emitted = target_steps;
+            }
+
+            let (steps_per_sec, step_direction) = if !enabled || fault {
+                (0u32, Direction::Forward)
+            } else if mode == Mode::Jog {
+                (JOG_STEPS_PER_SEC, direction)
+            } else {
+                let step_delta = target_steps - steps_emitted;
+                if step_delta == 0 {
+                    (0u32, Direction::Forward)
+                } else {
+                    let step_direction = if step_delta > 0 {
+                        Direction::Forward
+                    } else {
+                        Direction::Reverse
+                    };
+                    let rate = (step_delta.unsigned_abs() as u32).saturating_mul(TICK_HZ as u32);
+                    (rate, step_direction)
+                }
+            };
+
+            match carriage.set_rate(steps_per_sec, step_direction) {
+                Ok(()) => {
+                    if steps_per_sec != 0 && mode != Mode::Jog {
+                        steps_emitted = target_steps;
+                    } else if mode == Mode::Jog {
+                        let signed_rate = match step_direction {
+                            Direction::Forward => steps_per_sec as i64,
+                            Direction::Reverse => -(steps_per_sec as i64),
+                        };
+                        steps_emitted += signed_rate / TICK_HZ;
+                    }
+                }
+                Err(_) => {
+                    error!("step rate {} Hz out of range, stopping", steps_per_sec);
+                    carriage.stop();
+                }
+            }
+
+            // Refresh the shared status snapshot and, if nothing else is queued, push it out
+            // periodically (~5Hz) or immediately on an interlock edge.
+            {
+                let mut link_mut = link.borrow_mut();
+                link_mut.rpm = rpm;
+                link_mut.position = position;
+                link_mut.target_steps = target_steps;
+                link_mut.fault = fault;
+
+                push_countdown += 1;
+                let due = push_countdown >= 200;
+                if due {
+                    push_countdown = 0;
+                }
+                if link_mut
+                    .pending
+                    .is_none()
+                    && due
+                {
+                    let mut status_buf = [0u8; 96];
+                    let status = link_mut.format_status(&mut status_buf);
+                    link_mut.queue(|b| resp::write_push(b, status));
+                }
+            }
+
+            while tick_start.elapsed() < TICK {}
         }
 
-        status_countdown += 1;
-        if status_countdown >= 200 {
-            status_countdown = 0;
-            info!(
-                "spindle {} RPM, position {}, target_steps {}",
-                rpm, position, target_steps
-            );
+        // The inner loop only exits via disconnect (the `GotDisconnected` arm above). Drop
+        // `srv` explicitly so its borrow of `ble`/`gatt_attributes` ends here rather than at
+        // the (later) end of this block -- otherwise the borrow checker treats it as still
+        // live through the `ble.cmd_set_le_advertise_enable` call below.
+        drop(srv);
+        info!("BLE client disconnected, restarting advertising");
+        if ble
+            .cmd_set_le_advertise_enable(true)
+            .is_err()
+        {
+            error!("failed to restart advertising after disconnect");
         }
-
-        while tick_start.elapsed() < TICK {}
     }
+}
+
+fn now_millis() -> u64 {
+    Instant::now()
+        .duration_since_epoch()
+        .as_micros()
+        / 1000
 }
