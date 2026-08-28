@@ -60,27 +60,33 @@ impl<'d, PWM: PwmPeripheral, const TIM: u8, const OP: u8> StepGenerator<'d, PWM,
         steps_per_sec: u32,
         direction: Direction,
     ) -> Result<(), FrequencyError> {
-        self.dir_pin.set_level(match direction {
-            Direction::Forward => Level::High,
-            Direction::Reverse => Level::Low,
-        });
+        self.dir_pin
+            .set_level(match direction {
+                Direction::Forward => Level::High,
+                Direction::Reverse => Level::Low,
+            });
 
         if steps_per_sec == 0 {
-            self.timer.stop();
+            self.timer
+                .stop();
             return Ok(());
         }
 
-        let cfg = self.clock_cfg.timer_clock_with_frequency(
-            self.period,
-            PwmWorkingMode::Increase,
-            Rate::from_hz(steps_per_sec),
-        )?;
-        self.timer.start(cfg);
+        let cfg = self
+            .clock_cfg
+            .timer_clock_with_frequency(
+                self.period,
+                PwmWorkingMode::Increase,
+                Rate::from_hz(steps_per_sec),
+            )?;
+        self.timer
+            .start(cfg);
         Ok(())
     }
 
     /// Stops the pulse train immediately, leaving direction unchanged.
     pub fn stop(&mut self) {
-        self.timer.stop();
+        self.timer
+            .stop();
     }
 }

@@ -81,7 +81,12 @@ fn main() -> ! {
 
     let quad_pull = InputConfig::default().with_pull(Pull::Up);
     let mut spindle = QuadratureDecoder::new(
-        Pcnt::new(board.remaining.pcnt).unit0,
+        Pcnt::new(
+            board
+                .remaining
+                .pcnt,
+        )
+        .unit0,
         Input::new(board.d0, quad_pull),
         Input::new(board.d1, quad_pull),
     );
@@ -94,8 +99,15 @@ fn main() -> ! {
 
     let mcpwm_clock = PeripheralClockConfig::with_frequency(Rate::from_mhz(40))
         .expect("40MHz is representable from the MCPWM source clock");
-    let mut mcpwm = McPwm::new(board.remaining.mcpwm0, mcpwm_clock);
-    mcpwm.operator0.set_timer(&mcpwm.timer0);
+    let mut mcpwm = McPwm::new(
+        board
+            .remaining
+            .mcpwm0,
+        mcpwm_clock,
+    );
+    mcpwm
+        .operator0
+        .set_timer(&mcpwm.timer0);
     let step_pin = mcpwm
         .operator0
         .with_pin_a(board.d2, PwmPinConfig::UP_ACTIVE_HIGH);
@@ -133,8 +145,8 @@ fn main() -> ! {
         }
         interlocked = now_interlocked;
 
-        let target_steps =
-            (position * PITCH_UM * MICROSTEPS_PER_REV) / (BALLSCREW_PITCH_UM * SPINDLE_COUNTS_PER_REV);
+        let target_steps = (position * PITCH_UM * MICROSTEPS_PER_REV)
+            / (BALLSCREW_PITCH_UM * SPINDLE_COUNTS_PER_REV);
         let step_delta = target_steps - steps_emitted;
 
         let (steps_per_sec, direction) = if interlocked || step_delta == 0 {

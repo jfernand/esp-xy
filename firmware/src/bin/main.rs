@@ -47,22 +47,45 @@ fn main() -> ! {
 
     let quad_pull = InputConfig::default().with_pull(Pull::Up);
     let encoder = QuadratureDecoder::new(
-        Pcnt::new(board.remaining.pcnt).unit0,
+        Pcnt::new(
+            board
+                .remaining
+                .pcnt,
+        )
+        .unit0,
         Input::new(board.d0, quad_pull),
         Input::new(board.d1, quad_pull),
     );
 
-    let timg0 = TimerGroup::new(board.remaining.timg0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(board.remaining.sw_interrupt);
+    let timg0 = TimerGroup::new(
+        board
+            .remaining
+            .timg0,
+    );
+    let sw_interrupt = esp_hal::interrupt::software::SoftwareInterruptControl::new(
+        board
+            .remaining
+            .sw_interrupt,
+    );
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(board.remaining.wifi, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    let _connector = BleConnector::new(board.remaining.bt, Default::default());
+    let (mut _wifi_controller, _interfaces) = esp_radio::wifi::new(
+        board
+            .remaining
+            .wifi,
+        Default::default(),
+    )
+    .expect("Failed to initialize Wi-Fi controller");
+    let _connector = BleConnector::new(
+        board
+            .remaining
+            .bt,
+        Default::default(),
+    );
 
     loop {
-        board.user_led.toggle();
+        board
+            .user_led
+            .toggle();
         info!("encoder count: {}", encoder.count());
         let delay_start = Instant::now();
         while delay_start.elapsed() < Duration::from_millis(500) {}

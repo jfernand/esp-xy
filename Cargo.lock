@@ -962,8 +962,13 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-xy-protocol",
  "smoltcp",
 ]
+
+[[package]]
+name = "esp-xy-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "esp32"

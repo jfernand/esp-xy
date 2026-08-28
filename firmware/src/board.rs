@@ -80,15 +80,18 @@ pub struct UserLed<'d>(Output<'d>);
 
 impl<'d> UserLed<'d> {
     pub fn on(&mut self) {
-        self.0.set_low();
+        self.0
+            .set_low();
     }
 
     pub fn off(&mut self) {
-        self.0.set_high();
+        self.0
+            .set_high();
     }
 
     pub fn toggle(&mut self) {
-        self.0.toggle();
+        self.0
+            .toggle();
     }
 }
 
@@ -97,11 +100,13 @@ pub struct RfSwitch<'d>(Output<'d>);
 
 impl<'d> RfSwitch<'d> {
     pub fn enable(&mut self) {
-        self.0.set_low();
+        self.0
+            .set_low();
     }
 
     pub fn disable(&mut self) {
-        self.0.set_high();
+        self.0
+            .set_high();
     }
 }
 
@@ -111,8 +116,12 @@ pub struct AntennaSwitch<'d>(Output<'d>);
 impl<'d> AntennaSwitch<'d> {
     pub fn select(&mut self, antenna: Antenna) {
         match antenna {
-            Antenna::Internal => self.0.set_low(),
-            Antenna::External => self.0.set_high(),
+            Antenna::Internal => self
+                .0
+                .set_low(),
+            Antenna::External => self
+                .0
+                .set_high(),
         }
     }
 }
@@ -126,7 +135,8 @@ pub struct BootButton<'d>(Input<'d>);
 
 impl<'d> BootButton<'d> {
     pub fn is_pressed(&self) -> bool {
-        self.0.is_low()
+        self.0
+            .is_low()
     }
 }
 

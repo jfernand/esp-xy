@@ -62,7 +62,8 @@ impl<'d, const UNIT: usize> QuadratureDecoder<'d, UNIT> {
     /// the counter's 16-bit limits -- for anything that runs longer than a full wrap, call
     /// [`Self::update`] instead.
     pub fn count(&self) -> i16 {
-        self.unit.value()
+        self.unit
+            .value()
     }
 
     /// Folds the latest raw count into an extended, non-wrapping position and returns it.
@@ -73,7 +74,9 @@ impl<'d, const UNIT: usize> QuadratureDecoder<'d, UNIT> {
     /// half-range (65536 counts) -- true for any realistic polling rate, since that would mean
     /// hundreds of thousands of counts per tick.
     pub fn update(&mut self) -> i64 {
-        let raw = self.unit.value();
+        let raw = self
+            .unit
+            .value();
         let delta = raw.wrapping_sub(self.last_raw);
         self.last_raw = raw;
         self.position += delta as i64;
@@ -88,7 +91,8 @@ impl<'d, const UNIT: usize> QuadratureDecoder<'d, UNIT> {
 
     /// Resets both the hardware counter and the extended position to zero.
     pub fn reset(&mut self) {
-        self.unit.clear();
+        self.unit
+            .clear();
         self.position = 0;
         self.last_raw = 0;
     }

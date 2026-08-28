@@ -30,7 +30,12 @@ fn main() -> ! {
 
     let quad_pull = InputConfig::default().with_pull(Pull::Up);
     let encoder = QuadratureDecoder::new(
-        Pcnt::new(board.remaining.pcnt).unit0,
+        Pcnt::new(
+            board
+                .remaining
+                .pcnt,
+        )
+        .unit0,
         Input::new(board.d0, quad_pull),
         Input::new(board.d1, quad_pull),
     );

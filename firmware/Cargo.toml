@@ -1,0 +1,56 @@
+[package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+name = "esp-xy"
+rust-version = "1.88"
+version = "0.1.0"
+
+[[bin]]
+name = "esp-xy"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-xy-protocol = { path = "../protocol" }
+
+esp-hal = { version = "~1.1.0", features = ["defmt", "esp32c6", "unstable"] }
+
+esp-rtos = { version = "0.3.0", features = [
+    "defmt",
+    "esp-alloc",
+    "esp-radio",
+    "esp32c6",
+] }
+
+defmt = "1.0.1"
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32c6"] }
+
+bleps = { git = "https://github.com/bjoernQ/bleps", package = "bleps", rev = "a5148d8ae679e021b78f53fd33afb8bb35d0b62e", features = [
+    "async",
+    "macros",
+] }
+critical-section = "1.2.0"
+embedded-io = { version = "0.7.1", features = ["defmt"] }
+esp-alloc = { version = "0.10.0", features = ["defmt"] }
+esp-println = { version = "0.17.0", features = ["defmt-espflash", "esp32c6"] }
+esp-radio = { version = "0.18.0", features = [
+    "ble",
+    "coex",
+    "defmt",
+    "esp-alloc",
+    "esp32c6",
+    "unstable",
+    "wifi",
+] }
+smoltcp = { version = "0.13.0", default-features = false, features = [
+    "defmt",
+    "medium-ethernet",
+    "multicast",
+    "proto-dhcpv4",
+    "proto-dns",
+    "proto-ipv4",
+    "socket-dns",
+    "socket-icmp",
+    "socket-raw",
+    "socket-tcp",
+    "socket-udp",
+] }
