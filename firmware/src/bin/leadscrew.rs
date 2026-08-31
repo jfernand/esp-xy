@@ -633,11 +633,12 @@ fn main() -> ! {
             while tick_start.elapsed() < TICK {}
         }
 
-        // The inner loop only exits via disconnect (the `GotDisconnected` arm above). Drop
-        // `srv` explicitly so its borrow of `ble`/`gatt_attributes` ends here rather than at
+        // The inner loop only exits via disconnect (the `GotDisconnected` arm above). End
+        // `srv`'s borrow of `ble`/`gatt_attributes` here (via a discarding move) rather than at
         // the (later) end of this block -- otherwise the borrow checker treats it as still
-        // live through the `ble.cmd_set_le_advertise_enable` call below.
-        drop(srv);
+        // live through the `ble.cmd_set_le_advertise_enable` call below. `AttributeServer` has
+        // no `Drop` impl, so `drop(srv)` would just trip clippy's `drop_non_drop` lint.
+        let _ = srv;
         info!("BLE client disconnected, restarting advertising");
         if ble
             .cmd_set_le_advertise_enable(true)
