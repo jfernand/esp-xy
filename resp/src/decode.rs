@@ -1,4 +1,7 @@
-//! RESP frame decoding over BLE notification stream.
+//! RESP frame decoding over a byte stream (e.g. BLE notifications).
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// A parsed incoming RESP frame from the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,13 +46,13 @@ impl RespDecoder {
             match self.buffer[0] {
                 b'+' => {
                     let end = self.find_crlf(0)?;
-                    let _line = std::str::from_utf8(&self.buffer[1..end]).ok()?;
+                    let _line = core::str::from_utf8(&self.buffer[1..end]).ok()?;
                     self.consume(end + 2);
                     return Some(RespFrame::Ok);
                 }
                 b'-' => {
                     let end = self.find_crlf(0)?;
-                    let line = std::str::from_utf8(&self.buffer[1..end]).ok()?;
+                    let line = core::str::from_utf8(&self.buffer[1..end]).ok()?;
                     let err_msg = line
                         .strip_prefix("ERR ")
                         .unwrap_or(line)
@@ -60,7 +63,7 @@ impl RespDecoder {
                 b'$' | b'>' => {
                     let is_push = self.buffer[0] == b'>';
                     let header_end = self.find_crlf(0)?;
-                    let len_str = std::str::from_utf8(&self.buffer[1..header_end]).ok();
+                    let len_str = core::str::from_utf8(&self.buffer[1..header_end]).ok();
                     let payload_len: usize = match len_str.and_then(|s| {
                         s.parse()
                             .ok()
@@ -91,7 +94,7 @@ impl RespDecoder {
                         continue;
                     }
 
-                    let payload = std::str::from_utf8(&self.buffer[payload_start..payload_end])
+                    let payload = core::str::from_utf8(&self.buffer[payload_start..payload_end])
                         .ok()?
                         .to_string();
                     self.consume(total_end);
@@ -135,6 +138,7 @@ impl RespDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn decode_ok_and_err() {

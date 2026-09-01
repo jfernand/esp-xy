@@ -12,7 +12,7 @@ use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 use uuid::{Uuid, uuid};
 
-use crate::resp::{RespDecoder, RespFrame};
+use resp::{RespDecoder, RespFrame};
 use crate::types::{Direction, Mode, Status};
 
 /// Nordic UART Service (NUS) primary service UUID.
