@@ -1,5 +1,5 @@
 [package]
-name = "esp-xy-protocol"
+name = "resp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"

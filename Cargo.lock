@@ -1206,7 +1206,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
- "esp-xy-protocol",
+ "resp",
  "smoltcp",
 ]
 
@@ -1216,16 +1216,12 @@ version = "0.1.0"
 dependencies = [
  "btleplug",
  "clap",
- "esp-xy-protocol",
  "futures",
+ "resp",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]
-
-[[package]]
-name = "esp-xy-protocol"
-version = "0.1.0"
 
 [[package]]
 name = "esp32"
@@ -2013,6 +2009,10 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.1",
 ]
+
+[[package]]
+name = "resp"
+version = "0.1.0"
 
 [[package]]
 name = "riscv"

@@ -2,7 +2,7 @@
 members = [
     "client",
     "firmware",
-    "protocol",
+    "resp",
 ]
 resolver = "3"
 
